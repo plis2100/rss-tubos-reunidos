@@ -78,17 +78,86 @@ def convertir_fecha(texto):
 
 
 def es_enlace_noticia(url):
-    ruta = urlparse(url).path.rstrip("/")
+    ruta = urlparse(url).path.lower().rstrip("/")
 
-    # Formato utilizado por las noticias:
-    # /es/noticias/2021/titulo-de-la-noticia-350
-    return bool(
-        re.match(
-            r"^/es/noticias/\d{4}/[^/]+$",
-            ruta,
-            flags=re.IGNORECASE,
-        )
-    )
+    if "/es/noticias/" not in ruta:
+        return False
+
+    if ruta in {
+        "/es/noticias",
+        "/es/noticias/",
+    }:
+        return False
+
+    partes = [
+        parte
+        for parte in ruta.split("/")
+        if parte
+    ]
+
+    # Debe tener más elementos que /es/noticias
+    return len(partes) >= 4
+
+
+def obtener_lineas(texto):
+    lineas = []
+
+    for linea in (texto or "").splitlines():
+        linea = limpiar_texto(linea)
+
+        if not linea:
+            continue
+
+        if linea not in lineas:
+            lineas.append(linea)
+
+    return lineas
+
+
+def obtener_titulo_descripcion(texto):
+    lineas = obtener_lineas(texto)
+    candidatas = []
+
+    for linea in lineas:
+        linea_minuscula = linea.lower()
+
+        if convertir_fecha(linea) is not None:
+            continue
+
+        if linea_minuscula in {
+            "descubre más",
+            "descubre mas",
+            "leer más",
+            "leer mas",
+            "ver más",
+            "ver mas",
+            "noticias",
+            "noticias y eventos",
+        }:
+            continue
+
+        if "{{" in linea or "}}" in linea:
+            continue
+
+        candidatas.append(linea)
+
+    if not candidatas:
+        return "", ""
+
+    # En las tarjetas, la primera línea útil es el título.
+    titulo = candidatas[0]
+
+    descripcion_partes = [
+        linea
+        for linea in candidatas[1:]
+        if linea != titulo
+    ]
+
+    descripcion = limpiar_texto(
+        " ".join(descripcion_partes)
+    )[:1200]
+
+    return titulo, descripcion
 
 
 def obtener_noticias():
@@ -119,67 +188,82 @@ def obtener_noticias():
             timeout=90000,
         )
 
-        # Espera hasta que JavaScript cargue noticias reales.
+        # Espera a que Angular sustituya las variables
+        # {{item.fecha}} por las noticias reales.
         pagina.wait_for_function(
             """
-            () => Array.from(
-                document.querySelectorAll("a[href]")
-            ).some(
-                enlace =>
-                    /\\/es\\/noticias\\/\\d{4}\\//i.test(
-                        enlace.href
+            () => {
+                const texto = document.body.innerText || "";
+
+                return (
+                    !texto.includes("{{item.fecha}}") &&
+                    (
+                        /\\b\\d{4}-\\d{2}-\\d{2}\\b/.test(texto) ||
+                        /\\b\\d{1,2}\\/\\d{1,2}\\/\\d{4}\\b/.test(texto)
                     )
-            )
+                );
+            }
             """,
-            timeout=60000,
+            timeout=90000,
         )
 
-        pagina.wait_for_timeout(3000)
+        pagina.wait_for_timeout(5000)
 
         resultados = pagina.locator(
-            'a[href*="/es/noticias/"]'
+            'a[href*="/noticias/"]'
         ).evaluate_all(
             """
             enlaces => enlaces.map(enlace => {
                 let contenedor = enlace;
+                let encontrado = false;
 
-                for (let i = 0; i < 9; i++) {
-                    if (!contenedor.parentElement) {
-                        break;
-                    }
-
-                    contenedor = contenedor.parentElement;
-
-                    const texto = (
-                        contenedor.innerText || ""
-                    ).replace(/\\s+/g, " ").trim();
+                for (let i = 0; i < 10; i++) {
+                    const texto = contenedor.innerText || "";
 
                     if (
                         /\\b\\d{4}-\\d{2}-\\d{2}\\b/.test(texto) ||
                         /\\b\\d{1,2}\\/\\d{1,2}\\/\\d{4}\\b/.test(texto)
                     ) {
+                        encontrado = true;
                         break;
                     }
+
+                    if (!contenedor.parentElement) {
+                        break;
+                    }
+
+                    contenedor = contenedor.parentElement;
                 }
 
-                const encabezado = contenedor.querySelector(
-                    "h1, h2, h3, h4, h5, h6"
-                );
-
                 return {
-                    url: enlace.href,
-                    titulo: (
-                        encabezado?.innerText ||
-                        enlace.innerText ||
-                        ""
-                    ).replace(/\\s+/g, " ").trim(),
-                    texto: (
-                        contenedor.innerText || ""
-                    ).replace(/\\s+/g, " ").trim()
+                    url: enlace.href || "",
+                    texto: encontrado
+                        ? (contenedor.innerText || "")
+                        : ""
                 };
             })
             """
         )
+
+        # Respaldo: obtiene cualquier elemento que contenga
+        # una fecha y un enlace de noticia.
+        if not resultados:
+            resultados = pagina.locator(
+                "article, li, .item, .card, .news-item"
+            ).evaluate_all(
+                """
+                elementos => elementos.map(elemento => {
+                    const enlace = elemento.querySelector(
+                        'a[href*="/noticias/"]'
+                    );
+
+                    return {
+                        url: enlace?.href || "",
+                        texto: elemento.innerText || ""
+                    };
+                })
+                """
+            )
 
         navegador.close()
 
@@ -199,24 +283,9 @@ def obtener_noticias():
         if url in enlaces_vistos:
             continue
 
-        titulo = limpiar_texto(
-            resultado.get("titulo", "")
-        )
-        texto = limpiar_texto(
-            resultado.get("texto", "")
-        )
+        texto = resultado.get("texto", "")
 
-        if titulo.lower() in {
-            "descubre más",
-            "descubre mas",
-            "leer más",
-            "leer mas",
-            "ver más",
-            "ver mas",
-        }:
-            continue
-
-        if len(titulo) < 15:
+        if not texto:
             continue
 
         fecha = convertir_fecha(texto)
@@ -224,33 +293,12 @@ def obtener_noticias():
         if fecha is None:
             continue
 
-        descripcion = texto.replace(
-            titulo,
-            " ",
+        titulo, descripcion = obtener_titulo_descripcion(
+            texto
         )
 
-        descripcion = re.sub(
-            r"\b\d{4}-\d{2}-\d{2}\b",
-            " ",
-            descripcion,
-        )
-
-        descripcion = re.sub(
-            r"\b\d{1,2}/\d{1,2}/\d{4}\b",
-            " ",
-            descripcion,
-        )
-
-        descripcion = re.sub(
-            r"\bdescubre\s+m[aá]s\b",
-            " ",
-            descripcion,
-            flags=re.IGNORECASE,
-        )
-
-        descripcion = limpiar_texto(
-            descripcion
-        )[:1000]
+        if len(titulo) < 15:
+            continue
 
         noticias.append(
             {
@@ -356,7 +404,7 @@ def main():
         f"{len(noticias)} noticias"
     )
 
-    for noticia in noticias[:5]:
+    for noticia in noticias[:10]:
         print(
             noticia["fecha"].strftime("%d/%m/%Y"),
             "-",
